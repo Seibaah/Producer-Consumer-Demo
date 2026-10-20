@@ -1,43 +1,16 @@
 #pragma once
 
 // Single-producer / single-consumer, bounded, non-blocking latest-value handoff,
-// implemented as a lock-free triple buffer.
+// implemented as a lock-free triple buffer. Each of the three slots has exactly
+// one owner at any instant:
 //
-// Contract (from the exercise brief):
-//   - publish() is called by exactly one thread (Application) and never blocks.
-//   - try_read() is called by exactly one thread (Service SDK) and never blocks.
-//   - The consumer never observes fields from two different publications.
-//   - A newer value may overwrite an older unconsumed one (latest-value semantics).
-//   - Storage is fixed: three slots, independent of the producer/consumer rate gap.
-//   - std::atomic is the only synchronization mechanism (no mutex, no condvar).
+//   back   - the producer writes the next command here.
+//   middle - nobody; holds the latest complete publication (+ a FRESH bit).
+//   front  - the consumer copies the command out of here.
 //
-// How it works
-// ------------
-// There are three slots. At every instant each slot is owned by exactly one role:
-//
-//   back   - owned by the producer; it writes the next command here.
-//   middle - owned by nobody; holds the latest *complete* publication.
-//   front  - owned by the consumer; it copies the command out of here.
-//
-// The index of the middle slot lives in a single std::atomic<uint8_t>, together
-// with a FRESH bit meaning "middle holds a publication the consumer has not taken".
-//
-//   publish(v):  write v into back                         (plain stores, private slot)
-//                old = middle.exchange(back | FRESH, acq_rel)   <- publication point
-//                back = old & INDEX                        (recycle the old middle slot)
-//                report kSkippedUnread if old had FRESH    (an unread command was dropped)
-//
-//   try_read():  if FRESH is not set -> return false (nothing new)
-//                old = middle.exchange(front, acq_rel)     (hand back our slot, clear FRESH)
-//                front = old & INDEX
-//                copy out of front                         (plain loads, private slot)
-//
-// Because ownership only changes through the atomic exchange, a slot is never
-// written and read at the same time: torn reads are impossible by construction.
-// Neither side ever waits or retries: each call is one atomic exchange with no
-// loops in this code. That is wait-free on x86 and ARMv8.1+, where the exchange
-// is a single instruction; on ARMv8.0 the exchange itself compiles to a
-// load-linked/store-conditional retry loop, so there it is lock-free.
+// Ownership changes only through one atomic exchange on the middle index, so a
+// slot is never written and read at the same time. See docs/DESIGN.md for the
+// memory-ordering argument, the alternatives considered, and how it is tested.
 
 #include <atomic>
 #include <cassert>
@@ -118,13 +91,9 @@ public:
     }
 
 private:
-    // Debug-only enforcement of the single-producer / single-consumer contract:
-    // the first thread to use a role owns it; a call from any other live thread
-    // asserts. The check compiles away when NDEBUG is defined (Release builds),
-    // but the member exists in every build, so the class layout never depends
-    // on NDEBUG. Handing a role to a new thread after the old one has exited is
-    // not flagged (thread ids may be reused); that hand-over is safe if the old
-    // thread was joined.
+    // Debug builds assert if a second live thread uses the same role (producer or
+    // consumer). The check compiles away with NDEBUG; the member exists in every
+    // build so the class layout never depends on it.
     class RoleGuard {
     public:
         void check() noexcept {
